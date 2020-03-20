@@ -1,6 +1,8 @@
 package collector
 
 import (
+	"time"
+
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -18,6 +20,14 @@ type Filebeat struct {
 		Running   float64 `json:"running"`
 		Skipped   float64 `json:"skipped"`
 		Started   float64 `json:"started"`
+		Files     map[string]struct {
+			LastEventPublishedTime *FilebeatTime `json:"last_event_published_time,omitempty"`
+			LastEventTimestamp     *FilebeatTime `json:"last_event_timestamp"`
+			Name                   string        `json:"name"`
+			ReadOffset             float64       `json:"read_offset"`
+			Size                   float64       `json:"size"`
+			StartTime              *time.Time    `json:"start_time"`
+		} `json:"files"`
 	} `json:"harvester"`
 
 	Input struct {
@@ -36,9 +46,87 @@ type filebeatCollector struct {
 	metrics  exportedMetrics
 }
 
+func (c *filebeatCollector) buildFileInfoMetrics() exportedMetrics {
+	metrics := exportedMetrics{}
+
+	paths := make(map[string]bool)
+	for _, info := range c.stats.Filebeat.Harvester.Files {
+		if _, seen := paths[info.Name]; seen {
+			continue
+		}
+
+		paths[info.Name] = true
+		metrics = append(metrics, []struct {
+			desc    *prometheus.Desc
+			eval    func(stats *Stats) float64
+			valType prometheus.ValueType
+		}{
+			{
+				desc: prometheus.NewDesc(
+					prometheus.BuildFQName(c.beatInfo.Beat, "harvester", "size_bytes"),
+					"filebeat.harvester.file.size",
+					nil, prometheus.Labels{"path": info.Name},
+				),
+				eval:    func(stats *Stats) float64 { return info.Size },
+				valType: prometheus.GaugeValue,
+			},
+			{
+				desc: prometheus.NewDesc(
+					prometheus.BuildFQName(c.beatInfo.Beat, "harvester", "last_event_published_time"),
+					"filebeat.harvester.file.last_event_published_time",
+					nil, prometheus.Labels{"path": info.Name},
+				),
+				eval: func(stats *Stats) float64 {
+					if info.LastEventPublishedTime.Time != nil {
+						return float64(info.LastEventPublishedTime.Time.UTC().Unix())
+					}
+
+					return 0
+				},
+				valType: prometheus.UntypedValue,
+			},
+			{
+				desc: prometheus.NewDesc(
+					prometheus.BuildFQName(c.beatInfo.Beat, "harvester", "last_event_timestamp"),
+					"filebeat.harvester.file.last_event_timestamp",
+					nil, prometheus.Labels{"path": info.Name},
+				),
+				eval: func(stats *Stats) float64 {
+					if info.LastEventTimestamp.Time != nil {
+						return float64(info.LastEventTimestamp.Time.UTC().Unix())
+					}
+
+					return 0
+				},
+				valType: prometheus.UntypedValue,
+			},
+			{
+				desc: prometheus.NewDesc(
+					prometheus.BuildFQName(c.beatInfo.Beat, "harvester", "start_time"),
+					"filebeat.harvester.file.start_time",
+					nil, prometheus.Labels{"path": info.Name},
+				),
+				eval:    func(stats *Stats) float64 { return float64(info.StartTime.UTC().Unix()) },
+				valType: prometheus.UntypedValue,
+			},
+			{
+				desc: prometheus.NewDesc(
+					prometheus.BuildFQName(c.beatInfo.Beat, "harvester", "file_read_offset"),
+					"filebeat.harvester.file.file_read_offset",
+					nil, prometheus.Labels{"path": info.Name},
+				),
+				eval:    func(stats *Stats) float64 { return info.ReadOffset },
+				valType: prometheus.GaugeValue,
+			},
+		}...)
+	}
+
+	return metrics
+}
+
 // NewFilebeatCollector constructor
 func NewFilebeatCollector(beatInfo *BeatInfo, stats *Stats) prometheus.Collector {
-	return &filebeatCollector{
+	c := &filebeatCollector{
 		beatInfo: beatInfo,
 		stats:    stats,
 		metrics: exportedMetrics{
@@ -134,6 +222,8 @@ func NewFilebeatCollector(beatInfo *BeatInfo, stats *Stats) prometheus.Collector
 			},
 		},
 	}
+
+	return c
 }
 
 // Describe returns all descriptions of the collector.
@@ -147,6 +237,9 @@ func (c *filebeatCollector) Describe(ch chan<- *prometheus.Desc) {
 
 // Collect returns the current state of all metrics of the collector.
 func (c *filebeatCollector) Collect(ch chan<- prometheus.Metric) {
+	for _, f := range c.buildFileInfoMetrics() {
+		ch <- prometheus.MustNewConstMetric(f.desc, f.valType, f.eval(c.stats))
+	}
 
 	for _, i := range c.metrics {
 		ch <- prometheus.MustNewConstMetric(i.desc, i.valType, i.eval(c.stats))
